@@ -1,4 +1,6 @@
 # dex_bot.py
+from dotenv import load_dotenv
+load_dotenv()
 from flask import Flask, render_template
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Updater, CommandHandler, CallbackQueryHandler, MessageHandler, Filters, MessageFilter
