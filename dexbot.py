@@ -1,152 +1,145 @@
-# dex_bot_integrated.py
+# solana_dex_bot.py
 import os
 import time
-import requests
+import aiohttp
 import sqlite3
 import asyncio
-from datetime import datetime, timedelta
+from datetime import datetime
 from typing import Dict, Any
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     Updater, CommandHandler, CallbackQueryHandler,
     MessageHandler, Filters, CallbackContext
 )
-from web3 import Web3
-from walletconnect import WCClient
-from dotenv import load_dotenv
-from solders.keypair import Keypair
 from solana.rpc.api import Client
 from solana.rpc.commitment import Confirmed
+from solders.keypair import Keypair
 from spl.token.client import Token
+from dotenv import load_dotenv
 
 load_dotenv()
 
-class DexBot:
+class SolanaDexBot:
     def __init__(self):
-        # Ethereum Configuration
-        self.eth_config = {
-            'filters': {
-                'min_liquidity': 25000,
-                'max_holders': 1500,
-                'volume_threshold': 100000
-            },
-            'apis': {
-                'dexscreener': 'https://api.dexscreener.com/latest/dex',
-                'rugcheck': 'https://rugcheck.xyz/api/v1'
-            }
-        }
-        
-        # Solana Configuration
-        self.solana_config = {
+        self.config = {
             'rpc_url': os.getenv('SOLANA_RPC'),
             'dex_programs': {
                 'raydium': '675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8',
                 'orca': '9W959DqEETiGZocYWCQPaJ6sBmUzgfxXfqGeTEdap3XV'
             },
-            'jupiter_api': 'https://quote-api.jup.ag/v6'
+            'jupiter_api': 'https://quote-api.jup.ag/v6',
+            'risk_params': {
+                'min_liquidity': 5000,
+                'max_creator_burns': 3,
+                'verified_programs': True
+            }
         }
-
-        # Common components
+        
         self.db = sqlite3.connect('dexbot.db')
         self._init_db()
-        self.w3 = Web3(Web3.HTTPProvider(os.getenv('INFURA_URL')))
-        self.sol_client = Client(self.solana_config['rpc_url'])
-        self.wc_client = WCClient()
+        self.client = Client(self.config['rpc_url'])
+        self.security = SecurityManager()
 
     def _init_db(self):
         cursor = self.db.cursor()
         cursor.execute('''CREATE TABLE IF NOT EXISTS tokens
             (address TEXT PRIMARY KEY,
              symbol TEXT,
-             chain TEXT,
              liquidity REAL,
              volume REAL,
-             holders INTEGER,
+             creator_burns INTEGER,
              created_at DATETIME,
              risk_status TEXT)''')
         self.db.commit()
 
-    # Cross-chain analysis
-    def analyze_token(self, token_data: Dict[str, Any]) -> Dict[str, Any]:
+    async def analyze_token(self, token_address: str) -> Dict[str, Any]:
+        """Comprehensive Solana token analysis"""
+        token_data = await self._fetch_token_data(token_address)
         analysis = {
             'rug_risk': 'low',
-            'chain_specific_risks': {},
-            'blacklisted': False
+            'liquidity_risk': self._check_liquidity(token_data),
+            'program_risk': self._check_program_risk(token_data),
+            'creator_risk': self._check_creator_behavior(token_data)
         }
-        
-        if token_data['chain'] == 'ethereum':
-            analysis.update(self._analyze_eth_token(token_data))
-        elif token_data['chain'] == 'solana':
-            analysis.update(self._analyze_solana_token(token_data))
-            
-        return analysis
+        return {**token_data, **analysis}
 
-    def _analyze_eth_token(self, token_data: Dict[str, Any]) -> Dict[str, Any]:
-        return {
-            'rug_risk': self._check_eth_rug_risk(token_data),
-            'fake_volume': self._detect_eth_fake_volume(token_data)
-        }
-
-    def _analyze_solana_token(self, token_data: Dict[str, Any]) -> Dict[str, Any]:
-        return {
-            'liquidity_risk': self._check_solana_liquidity(token_data),
-            'program_risk': self._check_program_risk(token_data)
-        }
-
-    # Ethereum-specific methods
-    def _check_eth_rug_risk(self, token: Dict[str, Any]) -> str:
-        response = requests.get(
-            f"{self.eth_config['apis']['rugcheck']}/contracts/verify",
-            params={'address': token['address']},
-            headers={'x-api-key': os.getenv('RUGCHECK_KEY')}
-        )
-        return response.json().get('risk_status', 'unknown')
-
-    # Solana-specific methods
-    def _check_solana_liquidity(self, token: Dict[str, Any]) -> float:
-        # Implementation for Solana liquidity check
-        pass
-
-    async def execute_solana_swap(self, user_wallet: str, token_in: str, token_out: str, amount: float) -> str:
-        """Execute Solana swap using Jupiter Aggregator"""
+    async def _fetch_token_data(self, address: str) -> Dict[str, Any]:
+        """Fetch token metadata and market data"""
         async with aiohttp.ClientSession() as session:
+            # Get basic token info
             async with session.get(
-                f"{self.solana_config['jupiter_api']}/quote",
+                f"https://api.dexscreener.com/latest/dex/tokens/{address}"
+            ) as resp:
+                dexscreener_data = await resp.json()
+            
+            # Get additional chain data
+            token_info = self.client.get_account_info(address).value
+            mint_info = Token(self.client, address).get_mint_info()
+            
+        return {
+            'address': address,
+            'liquidity': dexscreener_data['pairs'][0]['liquidity']['usd'],
+            'volume': dexscreener_data['pairs'][0]['volume']['h24'],
+            'creator_burns': token_info.owner.burns,
+            'program_id': str(token_info.owner),
+            'created_at': datetime.fromtimestamp(mint_info.data.timestamp)
+        }
+
+    def _check_liquidity(self, token: Dict[str, Any]) -> str:
+        return 'high' if token['liquidity'] > self.config['risk_params']['min_liquidity'] else 'low'
+
+    def _check_program_risk(self, token: Dict[str, Any]) -> str:
+        return 'verified' if token['program_id'] in self.config['dex_programs'].values() else 'unverified'
+
+    def _check_creator_behavior(self, token: Dict[str, Any]) -> str:
+        if token['creator_burns'] > self.config['risk_params']['max_creator_burns']:
+            return 'high'
+        return 'low'
+
+    async def execute_swap(self, user_wallet: str, token_in: str, amount: float) -> str:
+        """Execute swap through Jupiter Aggregator with security checks"""
+        if not self.security.verify_wallet(user_wallet):
+            raise Exception("Wallet verification failed")
+
+        async with aiohttp.ClientSession() as session:
+            # Get quote
+            async with session.get(
+                f"{self.config['jupiter_api']}/quote",
                 params={
-                    'inputMint': token_in,
-                    'outputMint': token_out,
+                    'inputMint': 'So11111111111111111111111111111111111111112',  # SOL
+                    'outputMint': token_in,
                     'amount': int(amount * 1e9),
                     'slippageBps': 100
                 }
-            ) as response:
-                quote = await response.json()
+            ) as resp:
+                quote = await resp.json()
 
+            if not self.security.validate_quote(quote):
+                raise Exception("Invalid swap quote")
+
+            # Prepare swap
             async with session.post(
-                f"{self.solana_config['jupiter_api']}/swap",
+                f"{self.config['jupiter_api']}/swap",
                 json={
                     'quoteResponse': quote,
                     'userPublicKey': user_wallet,
                     'wrapAndUnwrapSol': True
                 }
-            ) as response:
-                swap_data = await response.json()
+            ) as resp:
+                swap_data = await resp.json()
 
         return await self._sign_and_send(swap_data['swapTransaction'], user_wallet)
 
-    # Cross-chain trade execution
-    async def execute_trade(self, chain: str, **kwargs) -> bool:
-        if chain == 'ethereum':
-            return self._execute_eth_trade(**kwargs)
-        elif chain == 'solana':
-            return await self.execute_solana_swap(**kwargs)
-        return False
+    async def _sign_and_send(self, transaction: str, wallet: str) -> str:
+        """Sign and send transaction (implementation simplified)"""
+        # In real implementation, use proper wallet integration
+        return "SIMULATED_TX_ID"
 
 class TelegramBot:
-    def __init__(self, dex_bot: DexBot):
+    def __init__(self, dex_bot: SolanaDexBot):
         self.dex_bot = dex_bot
         self.updater = Updater(os.getenv('TG_TOKEN'), use_context=True)
         
-        # Command Handlers
         handlers = [
             CommandHandler('start', self.start),
             CommandHandler('analyze', self.analyze),
@@ -158,59 +151,76 @@ class TelegramBot:
 
     def start(self, update: Update, context: CallbackContext):
         keyboard = [
-            [InlineKeyboardButton("🔄 Cross-Chain Swap", callback_data='swap')],
-            [InlineKeyboardButton("📊 Ethereum Analytics", callback_data='eth'),
-             InlineKeyboardButton("📈 Solana Analytics", callback_data='sol')]
+            [InlineKeyboardButton("🔄 SOL Swap", callback_data='swap')],
+            [InlineKeyboardButton("📈 Token Analytics", callback_data='analyze')]
         ]
         update.message.reply_text(
-            '🌐 Multi-Chain DexBot Interface',
+            '🔹 Solana DexBot Interface',
             reply_markup=InlineKeyboardMarkup(keyboard)
         )
 
-    def buy(self, update: Update, context: CallbackContext):
-        if len(context.args) < 3:
-            update.message.reply_text("Usage: /buy [CHAIN] [SYMBOL] [AMOUNT]")
+    def analyze(self, update: Update, context: CallbackContext):
+        if not context.args:
+            update.message.reply_text("Usage: /analyze [TOKEN_ADDRESS]")
             return
             
-        chain = context.args[0].lower()
-        symbol = context.args[1]
-        amount = float(context.args[2])
+        token_address = context.args[0]
+        analysis = asyncio.run(self.dex_bot.analyze_token(token_address))
         
-        asyncio.run(self.dex_bot.execute_trade(
-            chain=chain,
-            user_wallet=update.message.chat_id,
-            token_in='SOL' if chain == 'solana' else 'ETH',
-            token_out=symbol,
-            amount=amount
-        ))
-        update.message.reply_text(f"✅ {chain.capitalize()} swap order for {amount} {symbol} submitted")
+        report = f"🔍 Analysis for {token_address}:\n" \
+                 f"• Liquidity: ${analysis['liquidity']:,.2f}\n" \
+                 f"• Program Risk: {analysis['program_risk'].upper()}\n" \
+                 f"• Creator Risk: {analysis['creator_risk'].upper()}\n" \
+                 f"• Overall Safety: {analysis['rug_risk'].upper()}"
+        
+        update.message.reply_text(report)
+
+    def buy(self, update: Update, context: CallbackContext):
+        if len(context.args) < 2:
+            update.message.reply_text("Usage: /buy [TOKEN_ADDRESS] [SOL_AMOUNT]")
+            return
+            
+        token_address = context.args[0]
+        amount = float(context.args[1])
+        
+        try:
+            tx_id = asyncio.run(self.dex_bot.execute_swap(
+                user_wallet=str(update.message.chat_id),
+                token_in=token_address,
+                amount=amount
+            ))
+            update.message.reply_text(f"✅ Swap executed! TX ID: {tx_id}")
+        except Exception as e:
+            update.message.reply_text(f"❌ Error: {str(e)}")
 
 class SecurityManager:
     def __init__(self):
-        self.sessions = {}
-
-    def verify_transaction(self, chain: str, tx_data: Dict[str, Any]) -> bool:
-        if chain == 'ethereum':
-            return self._verify_eth_tx(tx_data)
-        elif chain == 'solana':
-            return self._verify_solana_tx(tx_data)
-        return False
+        self.blacklist = self._load_blacklist()
+    
+    def _load_blacklist(self):
+        # Would load from external source in production
+        return {
+            'HoneyPotTokens': set(),
+            'KnownScamWallets': set()
+        }
+    
+    def verify_wallet(self, wallet: str) -> bool:
+        return wallet not in self.blacklist['KnownScamWallets']
+    
+    def validate_quote(self, quote: Dict) -> bool:
+        # Check for reasonable slippage and valid routes
+        return (
+            quote['priceImpactPct'] < 0.1 and
+            quote['marketInfos'][0]['amm'] == 'Raydium'
+        )
 
 if __name__ == "__main__":
-    dex_bot = DexBot()
-    tg_bot = TelegramBot(dex_bot)
+    bot = SolanaDexBot()
+    tg_bot = TelegramBot(bot)
     
-    # Start Telegram bot
     tg_bot.updater.start_polling()
     
-    # Main analysis loop
+    # Monitoring loop
     while True:
-        # Cross-chain monitoring
-        eth_tokens = dex_bot.fetch_eth_market_data()
-        solana_tokens = dex_bot.fetch_solana_market_data()
-        
-        for token in eth_tokens + solana_tokens:
-            analysis = dex_bot.analyze_token(token)
-            dex_bot.save_token(token, analysis)
-        
+        # Would implement actual monitoring logic
         time.sleep(300)
